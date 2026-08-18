@@ -16,8 +16,11 @@ import httpx
 # Overridable at runtime: export INFERBENCH_REASONING_EFFORT=max
 REASONING_EFFORT = os.environ.get("INFERBENCH_REASONING_EFFORT") or None
 
-# Default sticky-routing header when --affinity is used and the provider did not set one.
-DEFAULT_SESSION_HEADER = "X-Session-Id"
+# Default sticky-routing header used when the provider did not set one.
+# Spelled as Tencent TokenHub documents it. Header names are case-insensitive per RFC 9110, so
+# routers that expect another capitalisation still match; override with INFERBENCH_SESSION_HEADER
+# if yours reads a different name entirely.
+DEFAULT_SESSION_HEADER = "X-Session-ID"
 
 
 def _env():
@@ -192,7 +195,7 @@ def build_provider(name):
         headers = {"Authorization": f"Bearer {_require_env(e, cfg['key_env'], 'API key')}"}
 
     # session_header: registry > <NAME>_SESSION_HEADER > INFERBENCH_SESSION_HEADER > None
-    # (--affinity then fills a default via ensure_affinity)
+    # (ensure_affinity then fills in the default if none of those set it)
     session_header = (
         cfg.get("session_header")
         or e.get(f"{p}_SESSION_HEADER")
@@ -208,9 +211,9 @@ def build_provider(name):
 
 
 def ensure_affinity(provider, enabled):
-    """If affinity is requested, ensure a session header is set (default X-Session-Id).
+    """Ensure a session header is set (default X-Session-ID) so session ids are actually sent.
 
-    Returns True when session ids will be sent. Without this, --affinity was a silent no-op
+    Returns True when session ids will be sent. Without this, sending them was a silent no-op
     for env-defined providers that never set session_header.
     """
     if not enabled:
@@ -218,7 +221,7 @@ def ensure_affinity(provider, enabled):
     if not provider.session_header:
         provider.session_header = os.environ.get("INFERBENCH_SESSION_HEADER", DEFAULT_SESSION_HEADER)
         print(
-            f"note: --affinity using header {provider.session_header!r} "
+            f"note: sending session ids in header {provider.session_header!r} "
             f"(set INFERBENCH_SESSION_HEADER or <NAME>_SESSION_HEADER / provider "
             f"session_header to match your router)",
             flush=True,

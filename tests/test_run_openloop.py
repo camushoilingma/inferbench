@@ -137,6 +137,56 @@ def test_request_log_has_one_row_per_request():
     assert all(r["conv_id"] for r in rows)
 
 
+class Recorder(FakeProvider):
+    """FakeProvider that remembers the session id it was handed for each turn."""
+    def __init__(self):
+        super().__init__()
+        self.seen = []
+
+    async def run_turn(self, client, messages, max_tokens, session_id=None):
+        self.seen.append(session_id)
+        return await super().run_turn(client, messages, max_tokens, session_id)
+
+
+def test_every_turn_carries_its_conversation_session_id():
+    """Every request must send a session id, the same one for every turn of a conversation and a
+    different one per conversation. That is what lets a router keep a conversation's turns on the
+    replica holding its prefix."""
+    provider = Recorder()
+    saved = R.SESSION_TAG
+    R.SESSION_TAG = "s7-1234"
+    try:
+        run(provider=provider, use_affinity=True, qps=20.0, dur=1.0)
+    finally:
+        R.SESSION_TAG = saved
+
+    assert provider.seen, "no requests were made"
+    assert all(s for s in provider.seen), "every request must carry a session id"
+    # tagged with seed + start time, so a rerun cannot reuse an id for a different conversation
+    # and inherit the replica the earlier one warmed
+    assert all(s.startswith("s7-1234-conv-") for s in provider.seen)
+    assert len(set(provider.seen)) > 1, "ids must differ per conversation, not be one global id"
+
+
+def test_conversation_keeps_one_session_id_across_its_turns():
+    import csv as _csv
+    provider = Recorder()
+    with tempfile.TemporaryDirectory() as directory:
+        path = os.path.join(directory, "requests.csv")
+        handle = R.open_request_log(path)
+        run(provider=provider, use_affinity=True, qps=10.0, dur=1.0, request_log=handle)
+        handle[0].close()
+        with open(path) as f:
+            rows = list(_csv.DictReader(f))
+    # conv_id is the session id, so a multi-turn conversation must repeat it
+    turns_per_id = {}
+    for r in rows:
+        turns_per_id.setdefault(r["conv_id"], []).append(int(r["turn"]))
+    assert any(len(v) > 1 for v in turns_per_id.values()), "no conversation was reused; test is blind"
+    for cid, turns in turns_per_id.items():
+        assert sorted(turns) == list(range(1, len(turns) + 1)), f"{cid} turns not contiguous: {turns}"
+
+
 def test_request_log_records_throttling_not_just_error():
     """A 429 must arrive as a quota signal, not collapse into a generic error count."""
     import csv as _csv

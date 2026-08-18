@@ -35,6 +35,10 @@ except ImportError:
 
 MAX_TURNS_PER_CONV = 8
 
+# Session ids must never be reused across runs for a DIFFERENT conversation, or the second run
+# inherits the first one's replica and its warm cache. Tagging with seed + start time guarantees it.
+SESSION_TAG = ""
+
 
 def pct(xs, p):
     xs = sorted(v for v in xs if v is not None)
@@ -49,14 +53,14 @@ def pct(xs, p):
 async def lane(client, provider, role, mode, deadline, seed, stats, use_affinity):
     rng = random.Random(seed)
     conv = W.Conversation(role, rng)
-    sid = f"conv-{seed}-0"
+    sid = f"{SESSION_TAG}-conv-{seed}-0"
     conv_n = 0
     turns = 0
     while time.monotonic() < deadline:
         if turns >= MAX_TURNS_PER_CONV:
             conv_n += 1
             conv = W.Conversation(role, rng)
-            sid = f"conv-{seed}-{conv_n}"
+            sid = f"{SESSION_TAG}-conv-{seed}-{conv_n}"
             turns = 0
         brk = W.should_break(role, rng, mode)
         messages, max_out = conv.next_turn(break_cache=brk)
@@ -111,8 +115,6 @@ async def main():
     ap.add_argument("--dur", type=int, default=40)
     ap.add_argument("--scale", type=float, default=1.0)
     ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--affinity", action="store_true",
-                    help="send a session id (sticky-routing header) for cache affinity")
     a = ap.parse_args()
     W.SIZE_SCALE = a.scale
     try:
@@ -120,10 +122,15 @@ async def main():
     except ValueError as e:
         print(f"error: {e}", file=sys.stderr)
         sys.exit(2)
-    use_affinity = ensure_affinity(prov, a.affinity)
+    # every conversation always carries its own session id, so a sticky router keeps its turns
+    # on the replica holding its prefix
+    global SESSION_TAG
+    use_affinity = ensure_affinity(prov, True)
+    SESSION_TAG = f"s{a.seed}-{int(time.time())}"
     levels = [int(x) for x in a.levels.split(",")]
     print(f"inferbench | provider={a.provider} role={a.role} mode={a.mode} "
-          f"affinity={use_affinity} scale={a.scale} | {a.dur}s/level | lanes=multi-turn conversations\n",
+          f"session_id=per-conversation scale={a.scale} | {a.dur}s/level | "
+          f"lanes=multi-turn conversations\n",
           flush=True)
     for lv in levels:
         await run_level(prov, a.role, a.mode, lv, a.dur, a.seed, use_affinity)

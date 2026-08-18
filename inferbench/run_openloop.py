@@ -1,12 +1,12 @@
 """Open-loop QPS ramp.
 
-Poisson (or uniform) arrivals at fixed offered-QPS targets, multi-turn conversations with
-optional session affinity, measuring fixed-window completion QPS, bounded drain,
+Poisson (or uniform) arrivals at fixed offered-QPS targets, multi-turn conversations each
+carrying their own session id, measuring fixed-window completion QPS, bounded drain,
 optional SLO goodput, TTFT/E2E, cache-hit, and errors per level.
 Reuses workload.py + providers.py (streams usage incl. cached_tokens).
 
 Usage:
-  python run_openloop.py --provider myapi --role heavy --mode real --affinity \
+  python run_openloop.py --provider myapi --role heavy --mode real \
     --levels 0.5,1,2,3,4,6 --dur 40 --scale 1.0
 """
 import argparse, asyncio, csv, json, time, random, math, sys
@@ -126,12 +126,16 @@ def write_request(handle, row):
     f, w = handle
     w.writerow(row); f.flush()
 
+# Session ids must never be reused across runs for a DIFFERENT conversation, or the second run
+# inherits the first one's replica and its warm cache. Tagging with seed + start time guarantees it.
+SESSION_TAG = ""
+
 class Conv:
     _n = 0
     def __init__(self, role, rng, total=None):
         self.conv = W.Conversation(role, rng, total=total)
         Conv._n += 1
-        self.sid = f"conv-{Conv._n}"
+        self.sid = f"{SESSION_TAG}-conv-{Conv._n}" if SESSION_TAG else f"conv-{Conv._n}"
         self.turns = 0
 
 async def run_level(client, provider, role, mode, qps, dur, use_affinity, seed, arrival,
@@ -322,7 +326,7 @@ async def main():
     ap.add_argument("--mode",default="real",choices=["fixed","broken","real"])
     ap.add_argument("--levels",default="0.1,0.25,0.5,0.75,1,1.5,2,3,4,5")
     ap.add_argument("--dur",type=int,default=90); ap.add_argument("--scale",type=float,default=1.0)
-    ap.add_argument("--affinity",action="store_true"); ap.add_argument("--seed",type=int,default=7)
+    ap.add_argument("--seed",type=int,default=7)
     ap.add_argument("--arrival",default="uniform",choices=["uniform","poisson"])
     ap.add_argument("--fixed-dist",dest="fixed_dist",action="store_true",
                     help="every level walks the same deterministic stratified size schedule (fair level comparison)")
@@ -385,11 +389,16 @@ async def main():
         prov=build_provider(a.provider)
     except ValueError as e:
         print(f"error: {e}", file=sys.stderr); sys.exit(2)
-    use_affinity = ensure_affinity(prov, a.affinity)
+    global SESSION_TAG
+    # Every conversation always carries its own session id, so a router that keys sticky routing on
+    # the header keeps a conversation's turns on the replica holding its prefix.
+    use_affinity = ensure_affinity(prov, True)
+    SESSION_TAG = f"s{a.seed}-{int(time.time())}"
     levels=[float(x) for x in a.levels.split(",")]
     ladder=[float(x) for x in a.size_ladder.split(",")] if a.size_ladder else None
     print(f"OPEN-LOOP ramp | provider={a.provider} role={a.role} mode={a.mode} "
-          f"affinity={use_affinity} scale={a.scale} arrival={a.arrival} | {a.dur}s/level | 1 replica\n")
+          f"session_id=per-conversation scale={a.scale} arrival={a.arrival} | "
+          f"{a.dur}s/level | 1 replica\n")
     print(f"{'Offer':>6s} | {'Sched':>5s} | {'N':>5s} | {'GDrop':>5s} | {'LagP95':>7s} | {'LagMax':>7s} | "
           f"{'Done@T':>6s} | {'CompQPS':>7s} | {'B@T':>4s} | {'dB':>3s} | {'Drain':>5s} | {'Pending@G':>9s} | "
           f"{'SLOQPS':>7s} | {'InP50':>6s} | {'InMean':>6s} | {'TTFTp50':>8s} | {'TTFTp95':>8s} | {'TTFTp99':>8s} | "

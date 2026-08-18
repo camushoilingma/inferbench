@@ -61,7 +61,6 @@ Inferbench does not choose a knee or fleet size. The result rows are the measure
 | `--stop-on-explode` | off | Stop ramp on congestion (`--explode-e2e-ms`, `--explode-errs`) |
 | `--explode-e2e-ms` | `45000` | E2E p95 threshold for congestion stop |
 | `--explode-errs` | `3` | Error-count threshold for congestion stop |
-| `--affinity` | off | Sticky session header (default `X-Session-Id`; override with `INFERBENCH_SESSION_HEADER`) |
 | `--role` | `heavy` | Size profile: `heavy` or `light` |
 | `--scale` | `1.0` | Scale token sizes (`<1` for dry runs) |
 
@@ -90,6 +89,20 @@ stream** — it contributes no tokens but its E2E still lands in the tail. Those
 until more than half of requests are cold, then flips to the cold mode, so it is wrong in both
 regimes. Measured on one run it read 0.5885 / 0.5891 / 0.5892 across a 4x change in rate while
 the mean moved 0.375 / 0.420 / 0.453.
+
+## Session ids
+
+Every conversation sends its own id in `X-Session-ID` on every turn, always. Routers that key
+sticky routing on that header then keep a conversation's turns on the replica already holding its
+prefix. Without it, consecutive turns can land on a replica that has never seen the conversation,
+which returns only whatever global prefix is shared by all traffic — a cache miss that costs full
+prefill. Measured on one endpoint, adding the header took warm-turn misses from 26.4% to zero.
+
+Point it at a different header with `INFERBENCH_SESSION_HEADER` (or `<NAME>_SESSION_HEADER`) if
+your router expects another name; a router that ignores the header is unaffected either way.
+
+Ids are tagged with the seed and the run's start time, so a rerun never reuses an id for a
+different conversation and inherits the replica the earlier one warmed.
 
 ## Sample size
 
