@@ -8,12 +8,7 @@ OpenAI-compatible endpoint uses the OpenAICompat client.
 import os
 import json
 import time
-import httpx
 
-# Reasoning-effort pin. None = send nothing -> the endpoint's own default. Pin a string ONLY for a like-for-like CAPACITY comparison
-# across endpoints. Reasoning models typically expose distinct paths, e.g.
-#   "none"/"minimal" -> ~0 reasoning tokens ; "low"/"medium"/"high" ; "xhigh"/"max".
-# Overridable at runtime: export INFERBENCH_REASONING_EFFORT=max
 REASONING_EFFORT = os.environ.get("INFERBENCH_REASONING_EFFORT") or None
 
 # Default sticky-routing header used when the provider did not set one.
@@ -21,15 +16,35 @@ REASONING_EFFORT = os.environ.get("INFERBENCH_REASONING_EFFORT") or None
 # routers that expect another capitalisation still match; override with INFERBENCH_SESSION_HEADER
 # if yours reads a different name entirely.
 DEFAULT_SESSION_HEADER = "X-Session-ID"
+TOKEN_PARAMS = ("both", "max_tokens", "max_completion_tokens")
+
+
+def token_budget_fields(n, token_param="both"):
+    """Fields that cap decode. TokenHub and others renamed max_tokens.
+
+    Default sends both so a stack that honors only one still gets the sampled
+    cap. Strict APIs that 400: pass max_tokens or max_completion_tokens alone.
+    """
+    n = int(n)
+    if token_param == "both":
+        return {"max_tokens": n, "max_completion_tokens": n}
+    if token_param in ("max_tokens", "max_completion_tokens"):
+        return {token_param: n}
+    raise ValueError(f"token_param must be one of {TOKEN_PARAMS}, got {token_param!r}")
+
+
+def resolve_token_param(*choices):
+    for choice in choices:
+        if not choice:
+            continue
+        if choice not in TOKEN_PARAMS:
+            raise ValueError(f"token_param must be one of {TOKEN_PARAMS}, got {choice!r}")
+        return choice
+    return "both"
 
 
 def _env():
-    """Credentials from the environment, with an optional .env overlay.
-
-    Set the keys your providers need directly in the environment (e.g. an API key per
-    provider, plus any base-URL vars), or point the INFERBENCH_ENV variable at a .env
-    file. Real environment variables win; the file only fills gaps.
-    """
+    """Process env, plus optional INFERBENCH_ENV file (real env vars win)."""
     d = dict(os.environ)
     path = os.environ.get("INFERBENCH_ENV")
     if path and os.path.exists(path):
@@ -44,28 +59,22 @@ class OpenAICompat:
     """OpenAI /v1/chat/completions streaming. base_url should include /v1."""
 
     def __init__(self, name, base_url, model, headers, extra_body=None, session_header=None,
-                 token_param="max_tokens"):
+                 token_param="both"):
         self.name = name
         self.url = base_url.rstrip("/") + "/chat/completions"
         self.model = model
         self.headers = {"Content-Type": "application/json", **headers}
         self.extra_body = extra_body or {}
-        self.session_header = session_header   # sticky-routing header for cache affinity, if any
-        # Output-cap field name. Default "max_tokens": honored by SGLang/vLLM and most
-        # OpenAI-compatible servers. OpenAI/gpt-5.x reasoning models require
-        # "max_completion_tokens". CRITICAL GOTCHA: some OpenAI-compatible endpoints SILENTLY
-        # IGNORE max_completion_tokens -> no output cap -> a reasoning model runs to the server
-        # default (often 65,536 = 2^16) -> multi-minute E2E that looks like slow serving but is
-        # runaway generation length. If you see OutMax == 65536, switch that provider to max_tokens.
-        self.token_param = token_param
+        self.session_header = session_header
+        self.token_param = resolve_token_param(token_param)
 
     async def run_turn(self, client, messages, max_tokens, session_id=None):
         body = {
             "model": self.model,
             "messages": messages,
-            self.token_param: max_tokens,
             "stream": True,
             "stream_options": {"include_usage": True},
+            **token_budget_fields(max_tokens, self.token_param),
             **({"reasoning_effort": REASONING_EFFORT} if REASONING_EFFORT else {}),
             **self.extra_body,
         }
@@ -74,7 +83,7 @@ class OpenAICompat:
             headers[self.session_header] = session_id
         t0 = time.monotonic()
         ttft = None
-        first_chunk = None   # time to first streamed chunk of any kind (prefill-done fallback)
+        first_chunk = None
         usage = {}
         finish_reason = None
         request_id = None
@@ -114,7 +123,7 @@ class OpenAICompat:
                         usage = j["usage"]
             e2e = time.monotonic() - t0
             if ttft is None:
-                ttft = first_chunk   # no content-bearing delta seen -> use first-chunk time
+                ttft = first_chunk
             cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens")
             return {
                 "ok": True, "ttft": ttft, "e2e": e2e,
@@ -133,25 +142,10 @@ class OpenAICompat:
             return {"ok": False, "code": type(e).__name__}
 
 
-# --- Provider registry -------------------------------------------------------
-# Add a provider = add ONE entry. Minimum is base_url + model + key_env (Bearer auth):
-#   "myprovider": {"base_url": "https://.../v1", "model": "the-model", "key_env": "MY_API_KEY"}
-# Optional keys for the rare cases:
-#   base_url_env   read the base URL from an env var instead of hardcoding it
-#   headers_env    custom auth headers {HeaderName: ENV_VAR} (instead of "Authorization: Bearer")
-#   token_param    "max_completion_tokens" for OpenAI/gpt-5.x; default "max_tokens" everywhere else
-#   extra_body     extra JSON fields sent on every request (e.g. {"reasoning_effort": "medium"})
-#   session_header sticky-routing header for prefix-cache affinity
-#
-# The entries below are EXAMPLES showing each feature — replace them with your own. Or skip this
-# table entirely: pass any name and set <NAME>_BASE_URL, <NAME>_MODEL, <NAME>_API_KEY in the
-# environment (see the fallback in build_provider).
+# Or skip the table: set <NAME>_BASE_URL, <NAME>_MODEL, <NAME>_API_KEY.
 PROVIDERS = {
-    # self-hosted SGLang/vLLM (Bearer auth, honors max_tokens):
     "local":  {"base_url": "http://localhost:30000/v1", "model": "your-model", "key_env": "LOCAL_API_KEY"},
-    # hosted OpenAI-compatible provider (Bearer auth); URL from an env var:
     "hosted": {"base_url_env": "HOSTED_BASE_URL", "model": "your-model", "key_env": "HOSTED_API_KEY"},
-    # OpenAI/gpt-5.x reasoning model (needs max_completion_tokens + a reasoning_effort):
     "openai": {"base_url": "https://api.openai.com/v1", "model": "your-model", "key_env": "OPENAI_API_KEY",
                "token_param": "max_completion_tokens", "extra_body": {"reasoning_effort": "medium"}},
 }
@@ -169,13 +163,12 @@ def _require_env(e, key, what):
     return val
 
 
-def build_provider(name):
+def build_provider(name, token_param=None):
     """Build a provider from the PROVIDERS registry, or from <NAME>_* env vars if unknown."""
     e = _env()
     cfg = PROVIDERS.get(name)
     p = name.upper().replace("-", "_")
     if cfg is None:
-        # Zero-code fallback: define it purely via environment variables.
         if f"{p}_BASE_URL" in e and f"{p}_MODEL" in e:
             cfg = {"base_url": e[f"{p}_BASE_URL"], "model": e[f"{p}_MODEL"],
                    "key_env": f"{p}_API_KEY"}
@@ -202,11 +195,18 @@ def build_provider(name):
         or e.get("INFERBENCH_SESSION_HEADER")
     )
     model = e.get(f"{p}_MODEL", cfg["model"])
+    token_param = resolve_token_param(
+        token_param,
+        e.get(f"{p}_TOKEN_PARAM"),
+        e.get("INFERBENCH_TOKEN_PARAM"),
+        cfg.get("token_param"),
+        "both",
+    )
     return OpenAICompat(
         name, base, model, headers,
         extra_body=cfg.get("extra_body"),
         session_header=session_header,
-        token_param=cfg.get("token_param", "max_tokens"),
+        token_param=token_param,
     )
 
 

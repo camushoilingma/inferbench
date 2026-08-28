@@ -1,150 +1,100 @@
 # Inferbench
 
 <p align="center">
-  <img src="assets/inferbench-logo.png" alt="Inferbench logo" width="120">
+  <img src="assets/inferbench-logo.png" alt="Inferbench" width="120">
 </p>
 
-Load test for LLM inference endpoints. Reports fixed-window completion QPS, bounded-drain diagnostics, optional SLO goodput, TTFT/E2E percentiles, prefix-cache hit rate, and a structured response curve.
+Load generator for long-context, multi-turn LLM endpoints.
 
-Open-loop fires requests at a target QPS regardless of how slow the server is (arrival-driven capacity); closed-loop keeps N concurrent conversations in flight and only issues the next turn when one finishes (`run.py`). Prefer open-loop (`run_openloop.py`) for the goodput knee.
-
-## Install
-
-```
-pip install -e .
-pip install -e ".[plots]"   # optional plotting deps
-```
+- Open-loop QPS ramp: fire on schedule, drop late arrivals, count in-window completions
+- Closed-loop concurrency ramp (`run.py`)
+- Multi-turn prefix cache with automatic session affinity
+- Fixed or laddered prompt-size schedules for comparable levels
+- Per-request and pre-run plan logs for diagnosis
+- `--max-ctx` clamp (default `heavy` draws up to 780k tokens)
 
 ## Run
 
 ```bash
+pip install -e .
+
 export MYAPI_BASE_URL="https://your-host/v1"
 export MYAPI_MODEL="your-model"
 export MYAPI_API_KEY="sk-..."
 
 python3 inferbench/run_openloop.py --provider myapi --mode real \
-    --arrival poisson --seed 7 --dur 600 --warmup 60 \
-    --drain-grace 90 --slo-e2e-ms 60000 \
-    --levels 2,4,6,8,10 --fixed-dist --stop-on-explode \
+    --max-ctx 128000 --arrival poisson --seed 7 --dur 600 --warmup 60 \
+    --drain-grace 90 --levels 2,4,6,8,10 --fixed-dist --stop-on-explode \
     --out results-seed-7.jsonl
 ```
 
-Output includes `Offer`, `Sched`, `N`, `GDrop`, `LagP95`, `LagMax`, `Done@T`, `CompQPS`, `B@T`, `dB`, `Drain`, `Pending@G`, `SLOQPS`, and latency/error columns. `GDrop` is an overdue arrival dropped by the load generator rather than burst-fired late; any drop halts the ramp. `CompQPS` is successful completions during the fixed post-warm-up offer window, not completions divided by an unbounded drain. `B@T` is all in-flight work when arrivals stop, including warm-up requests; `dB` is total backlog growth across the measurement window. `Pending@G` is work still pending after `--drain-grace`; strict mode halts on any pending request. Set `--slo-e2e-ms` to report per-request SLO goodput.
+Other flags: `--help`.
 
-Structured output uses explicit field units: latency and duration columns end in `_s`, arrival-lag columns end in `_ms`, token columns include `_tokens`, and throughput columns end in `_qps`.
+## Reading The Table
 
-Inferbench does not choose a knee or fleet size. The result rows are the measurement; select an operating point with your own SLOs for TTFT, E2E, error rate, backlog, and cost.
+`OfferedQPS` is the rate you asked for. `DoneQPS` is successes that finished inside the measurement window, divided by that window.
 
-## Useful flags
+A level held when `DoneQPS` is near `OfferedQPS`, `Growth` is near `0`, `Dropped = 0`, and `Left = 0`.
+
+You pick the SLO. Goodput is the highest offered QPS that held and whose latency, usually `E2Ep95`, is under that SLO.
+
+```text
+OfferedQPS  DoneQPS  Growth  Dropped  Left  E2Ep95
+      2.00     2.00       0        0     0     12s   held, under a 20s p95 SLO
+      4.00     3.10      40        0     0     45s   missed the rate and the SLO
+```
+
+Latency and token metrics use the same population as `Done`. Drain is leftover work after arrivals stop; finishing later does not raise `DoneQPS`.
+
+## Useful Flags
 
 | Flag | Default | Notes |
 | --- | --- | --- |
 | `--provider` | required | `PROVIDERS` key, or env: `<NAME>_BASE_URL` / `_MODEL` / `_API_KEY` |
-| `--levels` | `0.1,…,5` | Offered QPS points |
-| `--dur` | `90` | Seconds per level; longer → stabler tails |
-| `--warmup` | `0` | Discard first N seconds from all metrics |
-| `--drain-grace` | `300` | Bounded seconds to wait after arrivals stop |
-| `--slo-e2e-ms` | off | Per-request E2E deadline for SLO goodput |
-| `--max-arrival-lag-ms` | `50` | Absolute floor (ms) for arrival-lag budget |
-| `--max-arrival-lag-intervals` | `1.0` | Lag budget in mean inter-arrivals |
-| `--max-pending-frac` | `0` | Strict default; positive value is diagnostic only |
-| `--max-turns` | `2` | Turns per conversation before it retires; see Sample size |
-| `--request-log` | off | Write one row per request to a `.csv` |
-| `--plan-log` | off | Write each level's predicted arrivals and sizes before it runs |
+| `--levels` | `1,2,3,4,5` | Offered QPS points |
+| `--dur` | `90` | Seconds per level; longer means stabler tails |
+| `--warmup` | `30` | Discard first N seconds from metrics |
+| `--max-ctx` | off | Clamp every prompt to this many tokens |
+| `--timeout` | `1800` | Per-request HTTP timeout in seconds; `0` disables it |
+| `--token-param` | `both` | Send `max_tokens`, `max_completion_tokens`, or both |
+| `--fixed-dist` | off | Same deterministic distribution-shaped size schedule every level |
+| `--size-ladder` | off | Equal-share explicit sizes, e.g. `10000,25000,50000` |
+| `--max-turns` | `8` | Turns per conversation before it retires |
+| `--request-log` | off | Write one CSV row per completed request |
+| `--plan-log` | off | Write each level's planned arrivals and cold-conversation sizes |
 | `--out` | off | Write per-level rows to `.csv`, `.jsonl`, or `.json` |
 | `--append` | off | Append to `--out`, useful for multiple seeds |
-| `--seed` | `7` | Repeat across seeds for a defensible p95 |
 | `--arrival` | `uniform` | `poisson` or `uniform` |
-| `--mode` | `real` | Cache breaks: `real` / `fixed` (never) / `broken` (every turn) |
-| `--fixed-dist` | off | Same mean-stabilized size schedule every level |
-| `--pool` | `40` | Number of sizes in the fixed schedule |
-| `--stop-on-explode` | off | Stop ramp on congestion (`--explode-e2e-ms`, `--explode-errs`) |
-| `--explode-e2e-ms` | `45000` | E2E p95 threshold for congestion stop |
-| `--explode-errs` | `3` | Error-count threshold for congestion stop |
-| `--role` | `heavy` | Size profile: `heavy` or `light` |
-| `--scale` | `1.0` | Scale token sizes (`<1` for dry runs) |
+| `--mode` | `real` | Cache breaks: `real`, `fixed`, or `broken` |
+| `--pool` | `40` | Size of the fixed or ladder schedule |
 
-Env: `INFERBENCH_CACHE_FRACTION` (default `0.59`), `INFERBENCH_REASONING_EFFORT`, `INFERBENCH_SESSION_HEADER`. Optional: `INFERBENCH_ENV=/path/to/file` loads `KEY=value` lines into the process (real env vars win). Nothing auto-loads a local `.env`.
+Env: `INFERBENCH_CACHE_FRACTION` (default `0.59`), `INFERBENCH_REASONING_EFFORT`, `INFERBENCH_SESSION_HEADER`, `INFERBENCH_TOKEN_PARAM`. Optional: `INFERBENCH_ENV=/path/to/file` loads `KEY=value` lines into the process; real env vars win.
 
-`--dur` tip: use `--warmup 30–60`, then hold until you have ~1k steady-state completions and stable backlog. A level is not sustained merely because requests eventually drain after arrivals stop.
+## Things That Bite
 
-## Per-request log
+Every conversation sends its own id in `X-Session-ID` on every turn. Override the header with `INFERBENCH_SESSION_HEADER` or `<NAME>_SESSION_HEADER` if your router expects another name. A router that ignores the header is unaffected.
 
-`--request-log requests.csv` writes one row per request, flushed as each completes. Per-level
-rows cannot separate two things that look identical in aggregate:
+Ids are tagged with the seed and the run start time, so a rerun does not reuse an id for a different conversation and inherit the earlier replica cache.
 
-- **Throttling from failure.** `http_status` and `retry_after` carry a 429 as a quota signal
-  instead of collapsing it into an error count. On one endpoint this is how a rate limit was
-  found reproducing at 2.74M input tokens per trailing minute across separate runs, far below
-  the quota the key was rated for.
-- **Client queueing from endpoint latency.** `inflight` at dispatch, plus `arrival_lag_ms` and
-  the `cold` flag, show whether a slow number came from the server or from the load generator.
+`--max-ctx` clamps every prompt. Against a 32k or 128k model, uncapped `heavy` is errors or silent truncation, not a smaller workload.
 
-`finish_reason` is worth reading directly: `length` means the output cap bound rather than the
-model stopping. A row with HTTP 200, no `prompt_tokens` and no `finish_reason` is a **stalled
-stream** — it contributes no tokens but its E2E still lands in the tail. Those are counted in
-`stalled_streams`. Filter on `prompt_tokens` before computing any token statistic.
+`INFERBENCH_CACHE_FRACTION` is prompt composition, stable versus fresh, not a traffic-weighted hit. `--mode fixed` means never break the stable prefix; turn 1 is still cold.
 
-**Report `cache_hit_mean`, not `cache_hit_p50`.** The median is pinned near the design target
-until more than half of requests are cold, then flips to the cold mode, so it is wrong in both
-regimes. Measured on one run it read 0.5885 / 0.5891 / 0.5892 across a 4x change in rate while
-the mean moved 0.375 / 0.420 / 0.453.
+Report `cache_hit_mean`, not just `cache_hit_p50`. The median can stay pinned near the design target while the mean moves with cold-turn share and routing misses.
 
-## Session ids
+`--timeout` defaults to 1800s. The heavy output tail is 35k tokens, so one decode can outlast a shorter timeout and look like an outage. Use `--timeout 0` to disable it.
 
-Every conversation sends its own id in `X-Session-ID` on every turn, always. Routers that key
-sticky routing on that header then keep a conversation's turns on the replica already holding its
-prefix. Without it, consecutive turns can land on a replica that has never seen the conversation,
-which returns only whatever global prefix is shared by all traffic — a cache miss that costs full
-prefill. Measured on one endpoint, adding the header took warm-turn misses from 26.4% to zero.
+The output cap is sent as both `max_tokens` and `max_completion_tokens`. If an API rejects one field, pass `--token-param max_tokens` or `--token-param max_completion_tokens`. The `openai` provider already sends only `max_completion_tokens`.
 
-Point it at a different header with `INFERBENCH_SESSION_HEADER` (or `<NAME>_SESSION_HEADER`) if
-your router expects another name; a router that ignores the header is unaffected either way.
+`Dropped > 0` means this process missed the schedule. It may be the client rather than the endpoint. Any drop halts the ramp.
 
-Ids are tagged with the seed and the run's start time, so a rerun never reuses an id for a
-different conversation and inherits the replica the earlier one warmed.
+`--request-log` helps separate throttling from failures and client queueing from endpoint latency. `http_status`, `retry_after`, `request_id`, `inflight`, `arrival_lag_ms`, and `finish_reason` are all preserved.
 
-## Sample size
+`--plan-log` writes the arrival times and cold-conversation sizes a level is about to produce before it runs. It does not change what is sent.
 
-Effective sample size is **conversations, not requests**. Input size is constant within a
-conversation, so its 2nd..Nth turns are near-duplicates that cost tokens and buy no precision.
-Bootstrap by conversation; resampling by request treats near-duplicate turns as independent and
-gives intervals roughly 2x too narrow.
+`--fixed-dist` preserves the role distribution shape. `--size-ladder` gives every explicit size rung an equal share, so compare per-rung rather than treating the pooled median as production-shaped.
 
-`--max-turns` trades duplicate turns for independent size draws at the same request count and
-token spend. Two real runs, 95% CI on TTFT p50 by conversation bootstrap:
-
-```
-  37 requests,   7 conversations -> TTFT p50 5.30s, 95% CI [2.50, 11.16]
- 486 requests, 129 conversations -> TTFT p50 4.37s, 95% CI [ 3.79,  5.12]
-```
-
-The first spans both passing and failing a 3s SLO. Roughly 250 conversations per level resolves
-a 1s difference. The default of 2 yields 0.508 conversations per request against 0.184 at 8.
-
-The trade-off: turn 1 is always cold, so a lower cap raises cold share, lowers cache hit, and
-raises absolute TTFT. Runs at different `--max-turns` are comparable only size-controlled.
-Use `--max-turns 8` for longer conversations.
-
-## Plan log
-
-`--plan-log plan.csv` writes the arrival times and cold-conversation sizes each level is about
-to produce, before it runs. **It does not change what is sent** — it reads from throwaway
-`Random` copies of the live streams, so it predicts the schedule rather than replacing it.
-
-It confirms the harness offered the workload you configured. Arrivals are fully determined by
-`(seed, qps)`, so a mismatch means the generator fell behind rather than the RNG drifting. A
-seeded Poisson stream at a nominal 0.2 QPS held 139 arrivals in 900s, not 180 — that level
-offered 0.156 QPS, and anything dividing by the nominal rate would understate it by 30%.
-
-Conversation sizes are determined only up to order: the Nth cold conversation always has the
-same size, but how many a level creates depends on latency, because a slow endpoint starves the
-recycle pool and starts more cold, more expensive conversations. Comparing `cold_conversations`
-against the plan measures that drift.
-
-## Multi-seed summary
-
-Run each seed into a separate structured output, then summarize the curve without applying a policy:
+## Multi-Seed Summary
 
 ```bash
 python -m inferbench.summarize results-seed-*.jsonl --out summary.csv
@@ -152,40 +102,22 @@ python -m inferbench.summarize results-seed-*.jsonl --out summary.csv
 
 The summary reports run count plus median, minimum, maximum, and spread for every numeric metric at each offered QPS. It does not grade SLOs or select a knee.
 
-## Scripts
+## Other Scripts
 
-| Script | Role |
-| --- | --- |
-| `run_openloop.py` | Open-loop QPS ramp → knee |
-| `knee_at_hit.py` | Hold at a locked cache-hit; drift check |
-| `scaling_probe.py` | Prefill TTFT vs context length |
-| `decode_probe.py` | Decode tok/s |
-| `run.py` | Closed-loop concurrency ramp |
-| `summarize.py` | Cross-seed median/min/max/spread; no policy grading |
-| `validate_comp.py` | Smoke-check warm-turn cache-hit under affinity |
-| `workload.py` | Size distribution + cache composition (`ROLE_PROFILES`) |
-| `providers.py` | OpenAI-compatible client + registry |
-| `plot_scaling.py` | Plots for `scaling_probe.py` CSVs in `docs/data/` (not shipped) |
+- `locked_hit.py` - pin cache hit, then ramp
+- `scaling_probe.py` - prefill TTFT vs context length
+- `decode_probe.py` - decode tok/s
+- `run.py` - closed-loop concurrency ramp
+- `validate_comp.py` - smoke-check warm-turn cache hit under affinity
+
+Edit `ROLE_PROFILES` and `INFERBENCH_CACHE_FRACTION` to match your traffic.
 
 ## Tests
-
-Deterministic open-loop accounting tests use a fake provider and require no network:
 
 ```bash
 python tests/test_run_openloop.py
 ```
 
-They cover fixed-window completion, tail-in-grace, pending-after-grace, scheduler drops, SLO boundaries, error accounting, warm-up exclusion, and strict versus diagnostic pending policy.
-
-## Endpoint
-
-Export `<NAME>_BASE_URL`, `<NAME>_MODEL`, `<NAME>_API_KEY` (as in Run), or register the provider in `providers.py`. Edit `ROLE_PROFILES` / `INFERBENCH_CACHE_FRACTION` to match your traffic before sizing. For cache affinity, set `INFERBENCH_SESSION_HEADER` (or `<NAME>_SESSION_HEADER`) to whatever your router expects.
-
-## Contributing
-
-Contributions are welcome: open an issue or send a focused pull request.
-For measurement changes, include the command you used and what you observed.
-
----
+Contributions are welcome: open an issue or send a focused pull request. For measurement changes, include the command you used and what you observed.
 
 If Inferbench helps you size or compare serving stacks, please [star the repository](https://github.com/Asad-Ismail/inferbench) or share it with others doing the same work.
