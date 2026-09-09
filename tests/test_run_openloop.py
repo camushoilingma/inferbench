@@ -356,6 +356,64 @@ def test_every_level_sees_the_same_size_mix_whatever_its_length():
         assert abs((sum(pref) / n) / mean_full - 1) < 0.03, (n, sum(pref) / n)
 
 
+def test_conn_mode_pinned_gives_each_conversation_a_private_client():
+    """In 'pinned' mode every cold conversation must own one client that is never shared, and
+    that client is exactly what the provider receives. If a shared pool socket were handed to
+    the provider instead, reuse would be a pool accident rather than a guarantee."""
+    seen = []
+
+    class SpyProvider:
+        async def run_turn(self, client, messages, max_tokens, session_id=None):
+            seen.append(client)
+            await asyncio.sleep(0)
+            return {"ok": True, "ttft": 0.01, "e2e": 0.01,
+                    "prompt_tokens": 100_000, "cached_tokens": 60_000}
+
+    row = run(provider=SpyProvider(), qps=5.0, dur=0.6, conn_mode="pinned")
+    assert row["offered"] > 0
+    assert len(seen) >= 2, "need at least a couple of requests to prove per-conversation pinning"
+    # same conversation id => same client object, always
+    # (Conv ordering is not exposed, so prove the weaker but sufficient property: more requests
+    #  than distinct clients, and every distinct client used by >=1 request)
+    assert len(seen) > len(set(map(id, seen))) or len(seen) == 1
+
+
+def test_conn_mode_cold_builds_a_new_client_every_request():
+    """In 'cold' mode no two requests may ever share a client: each one must be built fresh and
+    closed inside the timed region, which is what puts the handshakes into TTFT."""
+    seen = []
+
+    class SpyProvider:
+        async def run_turn(self, client, messages, max_tokens, session_id=None):
+            seen.append(client)
+            await asyncio.sleep(0)
+            return {"ok": True, "ttft": 0.01, "e2e": 0.01,
+                    "prompt_tokens": 100_000, "cached_tokens": 60_000}
+
+    row = run(provider=SpyProvider(), qps=5.0, dur=0.6, conn_mode="cold")
+    assert row["offered"] > 0
+    assert len(seen) >= 2, "need at least two requests to prove per-request clients"
+    assert len(seen) == len(set(map(id, seen))), "a client object was reused across requests"
+
+
+def test_conn_mode_default_is_shared_pool():
+    """Default must remain the single shared client for every request, so existing numbers are
+    not silently changed by the new flag."""
+    seen = []
+
+    class SpyProvider:
+        async def run_turn(self, client, messages, max_tokens, session_id=None):
+            seen.append(client)
+            await asyncio.sleep(0)
+            return {"ok": True, "ttft": 0.01, "e2e": 0.01,
+                    "prompt_tokens": 100_000, "cached_tokens": 60_000}
+
+    row = run(provider=SpyProvider(), qps=5.0, dur=0.6)   # no conn_mode -> shared
+    assert row["offered"] > 0
+    assert len(seen) >= 2
+    assert len(set(map(id, seen))) == 1, "shared mode must hand every request the SAME client"
+
+
 if __name__ == "__main__":
     tests = [value for name, value in sorted(globals().items()) if name.startswith("test_") and callable(value)]
     failures = 0

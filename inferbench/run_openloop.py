@@ -125,11 +125,42 @@ class Conv:
         Conv._n += 1
         self.sid = f"{SESSION_TAG}-conv-{Conv._n}" if SESSION_TAG else f"conv-{Conv._n}"
         self.turns = 0
+        self.client = None   # set in conn_mode="pinned": a private 1-connection client
+
+# --conn-mode. Which TCP socket a conversation's turns travel over.
+#
+#   shared  — one connection pool for the whole run (default). A turn leaves on whatever socket is
+#             free, so all conversations share windows and any one conversation's turns can land on
+#             different sockets. Most production clients behave this way.
+#   pinned  — each conversation gets a private single-connection client, kept open across the whole
+#             conversation, so its turns always traverse ONE long-lived socket. This is the
+#             "keep-alive keeper" pattern: after the first turn the socket has a grown congestion
+#             window and the server's receive window is already trained, so subsequent turns do not
+#             repay TCP slow start and TLS handshakes. Connection reuse is the lever; per-route
+#             initcwnd only changes the first flight.
+#   cold    — a brand-new client, and therefore a brand-new TCP+TLS connection, for EVERY request.
+#             Both other modes amortise setup over many turns, hiding the cost this mode exists to
+#             measure: the handshake and the slow-start ramp on a long-RTT path. Use it to quantify
+#             what connection reuse is worth (e.g. the "N RTTs to upload a large prompt" cost).
+def make_pinned_client(timeout=None):
+    return httpx.AsyncClient(timeout=timeout,
+                             limits=httpx.Limits(max_connections=1,
+                                                 max_keepalive_connections=1,
+                                                 keepalive_expiry=3600.0))
+
+
+def make_cold_client(timeout=None):
+    return httpx.AsyncClient(timeout=timeout,
+                             limits=httpx.Limits(max_connections=1,
+                                                 max_keepalive_connections=0,
+                                                 keepalive_expiry=0.0))
+
 
 async def run_level(client, provider, role, mode, qps, dur, use_affinity, seed, arrival,
                     fixed_dist=False, pool=40, warmup=0.0, drain_grace=300.0,
                     max_arrival_lag_ms=50.0, max_arrival_lag_intervals=1.0,
-                    max_turns=None, request_log=None, plan_log=None, size_ladder=None):
+                    max_turns=None, request_log=None, plan_log=None, size_ladder=None,
+                    conn_mode="shared"):
     # Two independent, per-level RNG streams. A single shared stream fed BOTH the Poisson
     # arrivals AND the conversation seeds, but the conversation draw only fires when `free`
     # empties (latency-dependent) -> a faster endpoint consumed a different number of draws and
@@ -165,16 +196,25 @@ async def run_level(client, provider, role, mode, qps, dur, use_affinity, seed, 
                            + [{"offered_qps": qps, "kind": "conv_total", "idx": i, "value": v}
                               for i, v in enumerate(plan_sizes)], append=True)
     free = []
+    pinned_clients = []   # conn_mode="pinned": one private client per conversation, closed after the drain
     async def one(cv, fire_rel, cold, lag_ms):
         brk = W.should_break(role, cv.conv.rng, mode)
         messages, max_out = cv.conv.next_turn(break_cache=brk)
         st["inflight"] += 1
         st["inflight_peak"] = max(st["inflight_peak"], st["inflight"])
         inflight_at_dispatch = st["inflight"]
+        # conn_mode="cold": built and torn down INSIDE the timed region on purpose. The TCP+TLS
+        # handshake and the slow-start ramp are the cost being measured, so they must land in
+        # TTFT/E2E, not be paid outside it. Timeout follows the shared client (1800s default);
+        # a shorter one would silently turn into an errors column instead of a latency column.
+        cold_client = make_cold_client() if conn_mode == "cold" else None
         try:
-            r = await provider.run_turn(client, messages, max_out, session_id=cv.sid if use_affinity else None)
+            r = await provider.run_turn(cold_client or cv.client or client, messages, max_out,
+                                        session_id=cv.sid if use_affinity else None)
         finally:
             st["inflight"] -= 1
+            if cold_client is not None:
+                await cold_client.aclose()
         cv.turns += 1
         done_rel = time.monotonic() - t0
         counted = fire_rel >= warmup
@@ -237,6 +277,9 @@ async def run_level(client, provider, role, mode, qps, dur, use_affinity, seed, 
         else:
             tot = sizes[cold_n % len(sizes)] if sizes else None  # fixed schedule (deterministic) or random
             cv = Conv(role, random.Random(conv_rng.random()), total=tot); cold_n += 1; cold = True
+            if conn_mode == "pinned":
+                cv.client = make_pinned_client()
+                pinned_clients.append(cv.client)
         fire_rel = time.monotonic()-t0
         st["all_fire_t"].append(fire_rel)
         if fire_rel >= warmup:
@@ -251,6 +294,13 @@ async def run_level(client, provider, role, mode, qps, dur, use_affinity, seed, 
             await asyncio.gather(*pending, return_exceptions=True)
     else:
         pending = set()
+    # conn_mode="pinned": private sockets are part of the measured setup; close them only after the
+    # drain so no turn loses its socket mid-conversation.
+    for pc in pinned_clients:
+        try:
+            await pc.aclose()
+        except Exception:
+            pass
     meas_win = max(1e-9, dur-warmup)
     events = st["events"]
     fired = len(st["fire_t"])
@@ -346,6 +396,19 @@ async def main():
                          "within a conversation; lower values buy independent size draws at the same "
                          "token spend. Runs at different values are not comparable on cache_hit or "
                          "absolute latency, only size-controlled")
+    ap.add_argument("--conn-mode",dest="conn_mode",default="shared",
+                    choices=["shared","pinned","cold"],
+                    help="which TCP socket a conversation's turns travel over. 'shared' (default): one "
+                         "pool for the whole run, like most production clients. 'pinned': each "
+                         "conversation gets ONE long-lived connection kept open across its turns, so "
+                         "turn 2+ ride a grown congestion window and a trained server receive window "
+                         "instead of repaying slow start and the TLS handshake. 'cold': a brand-new "
+                         "TCP+TLS connection per REQUEST, built inside the timed region, so every "
+                         "request pays the handshakes and the slow-start ramp. Compare cold vs "
+                         "pinned/shared to quantify what connection reuse is worth on a long-RTT "
+                         "path (the 'N RTTs to upload a large prompt' cost). Runs at different "
+                         "conn-modes are not comparable on absolute TTFT; compare per fresh-token "
+                         "band or against your own production client's behaviour.")
     ap.add_argument("--request-log",dest="request_log",
                     help="write one row per REQUEST to this .csv (flushed per row). Needed to "
                          "separate throttling from errors and client queueing from endpoint latency; "
@@ -397,7 +460,7 @@ async def main():
         ap.error("--size-ladder values must be > 0")
     print(f"OPEN-LOOP ramp | provider={a.provider} role={a.role} mode={a.mode} "
           f"session_id=per-conversation affinity={use_affinity} scale={a.scale} arrival={a.arrival} "
-          f"max-ctx={a.max_ctx or 'off'} timeout={a.timeout or 'off'} "
+          f"max-ctx={a.max_ctx or 'off'} timeout={a.timeout or 'off'} conn-mode={a.conn_mode} "
           f"token-param={prov.token_param} | {a.dur}s/level")
     if a.warmup == 0:
         print("note: --warmup 0; cold start is in the numbers")
@@ -425,13 +488,14 @@ async def main():
                                   max_arrival_lag_ms=a.max_arrival_lag_ms,
                                   max_arrival_lag_intervals=a.max_arrival_lag_intervals,
                                   max_turns=a.max_turns, request_log=req_handle, plan_log=a.plan_log,
-                                  size_ladder=ladder)
+                                  size_ladder=ladder, conn_mode=a.conn_mode)
             row.update({
                 "seed": a.seed, "role": a.role, "mode": a.mode, "arrival": a.arrival,
                 "duration_s": a.dur, "warmup_s": a.warmup, "drain_grace_s": a.drain_grace,
                 "fixed_dist": a.fixed_dist, "max_pending_frac": a.max_pending_frac,
                 "size_ladder": a.size_ladder or "", "max_turns": a.max_turns,
                 "max_ctx": a.max_ctx, "timeout_s": a.timeout, "token_param": prov.token_param,
+                "conn_mode": a.conn_mode,
             })
             rows.append(row)
             left_tol = pending_tolerance(row["fired"], a.max_pending_frac)

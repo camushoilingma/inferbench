@@ -10,6 +10,7 @@ Load generator for long-context, multi-turn LLM endpoints.
 - Closed-loop concurrency ramp (`run.py`)
 - Multi-turn prefix cache with automatic session affinity
 - Fixed or laddered prompt-size schedules for comparable levels
+- Connection-reuse modes: `shared`, `pinned` (one warm socket per conversation), `cold` (fresh TCP+TLS per request)
 - Per-request and pre-run plan logs for diagnosis
 - `--max-ctx` clamp (default `heavy` draws up to 780k tokens)
 
@@ -67,6 +68,7 @@ Latency and token metrics use the same population as `Done`. Drain is leftover w
 | `--arrival` | `uniform` | `poisson` or `uniform` |
 | `--mode` | `real` | Cache breaks: `real`, `fixed`, or `broken` |
 | `--pool` | `40` | Size of the fixed or ladder schedule |
+| `--conn-mode` | `shared` | `shared`: one pool for the whole run. `pinned`: one long-lived connection per conversation, so turns 2+ ride a grown congestion window. `cold`: fresh TCP+TLS per request, built inside the timed region |
 
 Env: `INFERBENCH_CACHE_FRACTION` (default `0.59`), `INFERBENCH_REASONING_EFFORT`, `INFERBENCH_SESSION_HEADER`, `INFERBENCH_TOKEN_PARAM`. Optional: `INFERBENCH_ENV=/path/to/file` loads `KEY=value` lines into the process; real env vars win.
 
@@ -93,6 +95,8 @@ The output cap is sent as both `max_tokens` and `max_completion_tokens`. If an A
 `--plan-log` writes the arrival times and cold-conversation sizes a level is about to produce before it runs. It does not change what is sent.
 
 `--fixed-dist` preserves the role distribution shape. `--size-ladder` gives every explicit size rung an equal share, so compare per-rung rather than treating the pooled median as production-shaped.
+
+`--conn-mode` numbers are not interchangeable. `shared` is what a typical HTTP client with connection pooling does. `pinned` is the strongest reuse case: one socket per conversation, kept warm across turns. `cold` pays the TCP+TLS handshake and the slow-start ramp inside every request's TTFT. The gap between `cold` and `pinned` at the same size is exactly what connection reuse buys on a long-RTT path; on a short-RTT path it is mostly handshakes. If your production client opens a new TLS session per request, `cold` is your number and the fix is client-side pooling.
 
 ## Multi-Seed Summary
 
