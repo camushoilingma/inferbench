@@ -98,12 +98,19 @@ class OpenAICompat:
                             "retry_after": r.headers.get("retry-after"),
                             "request_id": r.headers.get("x-request-id"),
                             "error_body": body_text}
+                # SSE data: [DONE] marks the logical stream end, but the HTTP
+                # chunked response may still have a final chunk to drain. Letting
+                # the iterator finish naturally keeps the connection reusable.
+                saw_done = False
                 async for line in r.aiter_lines():
                     if not line.startswith("data: "):
                         continue
                     d = line[6:]
                     if d == "[DONE]":
-                        break
+                        saw_done = True
+                        continue
+                    if saw_done:
+                        continue
                     try:
                         j = json.loads(d)
                     except Exception:
