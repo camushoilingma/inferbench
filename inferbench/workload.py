@@ -26,6 +26,17 @@ ROLE_PROFILES = {
         "output":  [(0.0, 20), (0.5, 630), (0.95, 2000), (1.0, 6000)],
         "break_rate": 0.02,
     },
+    # Prosus production GLM-5.2 planner, 7d to 2026-09-24.
+    # input  p50=131k  p95=299k  p99=501k,  output  p50=240  p95=2,929  p99=7,517.
+    # Cache 0.99 designed; Tencent returned 0.988-0.989 per request, 0.70-0.76 token-weighted.
+    "planner_glm52": {
+        "total":   [(0.0, 2000), (0.05, 25000), (0.25, 74000), (0.50, 131000),
+                    (0.75, 195000), (0.90, 262000), (0.95, 299000), (0.99, 501000),
+                    (1.0, 850000)],
+        "output":  [(0.0, 10), (0.10, 60), (0.50, 240), (0.75, 750),
+                    (0.90, 1600), (0.95, 2929), (0.99, 7517), (1.0, 25000)],
+        "break_rate": 0.01,   # 0.99 designed cache — only 1 in 100 turns breaks deliberately
+    },
 }
 
 SIZE_SCALE = 1.0  # set < 1 for cheap dry runs

@@ -155,6 +155,12 @@ PROVIDERS = {
     "hosted": {"base_url_env": "HOSTED_BASE_URL", "model": "your-model", "key_env": "HOSTED_API_KEY"},
     "openai": {"base_url": "https://api.openai.com/v1", "model": "your-model", "key_env": "OPENAI_API_KEY",
                "token_param": "max_completion_tokens", "extra_body": {"reasoning_effort": "medium"}},
+    # Tencent TokenHub endpoints. Set TENCENTEU_API_KEY / TENCENTINTL_API_KEY in the environment.
+    # INFERBENCH_CACHE_FRACTION and --role planner_glm52 for the Prosus planner workload.
+    "tencenteu": {"base_url": "https://tokenhub-eu.tencentcloudmaas.com/v1", "model": "glm-5.2",
+                  "key_env": "TENCENTEU_API_KEY"},
+    "tencentintl": {"base_url": "https://tokenhub-intl.tencentcloudmaas.com/v1", "model": "glm-5.2",
+                    "key_env": "TENCENTINTL_API_KEY"},
 }
 
 
